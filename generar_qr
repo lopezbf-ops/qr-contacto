@@ -1,0 +1,649 @@
+streamlit
+qrcode[pil]
+pillow
+fpdf2
+import streamlit as st
+import qrcode
+from qrcode.image.styledpil import StyledPilImage
+from qrcode.image.styles.moduledrawers import RoundedModuleDrawer, SquareModuleDrawer
+from qrcode.image.styles.colormasks import SolidFillColorMask
+import qrcode.image.svg
+from PIL import Image
+import io
+import urllib.parse
+from fpdf import FPDF
+import tempfile
+import os
+
+# --- CONFIGURACIÓN DE PÁGINA ---
+st.set_page_config(
+    page_title="Tarjeta Digital y Generador QR",
+    page_icon="📱",
+    layout="wide"
+)
+
+# --- ESTILOS CSS PERSONALIZADOS ---
+st.markdown("""
+    <style>
+    .stApp {
+        background-color: #FAF3E6;
+    }
+    h1, h2, h3 {
+        color: #003153;
+    }
+    .stButton>button {
+        background-color: #003153;
+        color: #FAF3E6;
+        border-radius: 6px;
+        border: none;
+    }
+    .stButton>button:hover {
+        background-color: #004777;
+        color: #FFFFFF;
+    }
+    .tarjeta-digital {
+        max-width: 440px;
+        margin: 0 auto;
+        background-color: #FFFFFF;
+        border: 2px solid #003153;
+        border-radius: 14px;
+        padding: 28px 22px;
+        text-align: center;
+        box-shadow: 0 6px 18px rgba(0, 49, 83, 0.12);
+    }
+    .btn-accion {
+        display: block;
+        width: 100%;
+        padding: 13px 16px;
+        margin: 10px 0;
+        background-color: #003153;
+        color: #FAF3E6 !important;
+        text-decoration: none;
+        font-weight: 600;
+        font-size: 16px;
+        border-radius: 8px;
+        text-align: center;
+    }
+    .btn-accion:hover {
+        background-color: #004777;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
+# ==============================================================================
+# MODO TARJETA DIGITAL INTERACTIVA (SE ACTIVA AL ESCANEAR EL QR INTERACTIVO)
+# ==============================================================================
+params = st.query_params
+if params.get("vista") == "tarjeta":
+    t_nombre = params.get("n", "Fernando")
+    t_apellidos = params.get("a", "López Barrera")
+    t_titulo = params.get("t", "Nutriólogo")
+    t_empresa = params.get("e", "Instituto de Neurobiología, UNAM")
+    t_tel = params.get("tel", "+524422381028")
+    t_correo = params.get("mail", "lopezbfe@unam.mx")
+    t_web = params.get("web", "https://www.inb.unam.mx")
+    t_dir = params.get("dir", "Campus Juriquilla, Blvd. Juriquilla 3001, Querétaro, Qro., 76230, México")
+
+    uri_tel = f"tel:{t_tel}"
+    uri_mail = f"mailto:{t_correo}?subject={urllib.parse.quote('Contacto desde Tarjeta Digital')}"
+    uri_web = t_web if t_web.startswith("http") else f"https://{t_web}"
+    uri_map = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(t_dir)}"
+
+    # Generar archivo .vcf descargable desde el celular
+    vcf_data = (
+        f"BEGIN:VCARD\n"
+        f"VERSION:3.0\n"
+        f"N;CHARSET=UTF-8:{t_apellidos};{t_nombre};;;\n"
+        f"FN;CHARSET=UTF-8:{t_nombre} {t_apellidos}\n"
+        f"ORG;CHARSET=UTF-8:{t_empresa}\n"
+        f"TITLE;CHARSET=UTF-8:{t_titulo}\n"
+        f"TEL;TYPE=WORK,VOICE:{t_tel}\n"
+        f"EMAIL;TYPE=WORK,INTERNET:{t_correo}\n"
+        f"URL:{uri_web}\n"
+        f"ADR;TYPE=WORK;CHARSET=UTF-8:;;{t_dir};;;;\n"
+        f"END:VCARD"
+    )
+
+    st.markdown(f"""
+        <div class="tarjeta-digital">
+            <h2 style="margin-bottom: 4px; color: #003153;">{t_nombre} {t_apellidos}</h2>
+            <p style="margin: 0; font-weight: 600; color: #335C7A; font-size: 16px;">{t_titulo}</p>
+            <p style="margin: 4px 0 18px 0; color: #555555; font-size: 14px;">{t_empresa}</p>
+            <hr style="border: 0; border-top: 1px solid #D9CFC1; margin-bottom: 18px;">
+            <a class="btn-accion" href="{uri_tel}">📞 Llamar ({t_tel})</a>
+            <a class="btn-accion" href="{uri_mail}">✉️ Enviar Correo ({t_correo})</a>
+            <a class="btn-accion" href="{uri_web}" target="_blank">🌐 Visitar Sitio Web</a>
+            <a class="btn-accion" href="{uri_map}" target="_blank">📍 Abrir Ubicación en Mapa</a>
+        </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+    col_c1, col_c2, col_c3 = st.columns([1, 2, 1])
+    with col_c2:
+        st.download_button(
+            label="📇 Guardar Contacto en Agenda (.vcf)",
+            data=vcf_data.encode("utf-8"),
+            file_name=f"{t_nombre}_{t_apellidos}.vcf",
+            mime="text/vcard",
+            use_container_width=True
+        )
+    st.stop()
+
+# ==============================================================================
+# FUNCIONES DE GENERACIÓN DE QR Y PDF (MODO GENERADOR)
+# ==============================================================================
+def hex_to_rgb(hex_color):
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def generar_qr_png(datos, color_frente="#003153", color_fondo="#FAF3E6", logo_file=None, redondeado=False):
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=14,
+        border=2,
+    )
+    qr.add_data(datos)
+    qr.make(fit=True)
+
+    rgb_frente = hex_to_rgb(color_frente)
+    rgb_fondo = hex_to_rgb(color_fondo)
+
+    drawer = RoundedModuleDrawer() if redondeado else SquareModuleDrawer()
+
+    img = qr.make_image(
+        image_factory=StyledPilImage,
+        module_drawer=drawer,
+        color_mask=SolidFillColorMask(back_color=rgb_fondo, front_color=rgb_frente)
+    ).convert("RGBA")
+
+    if logo_file is not None:
+        logo_file.seek(0)
+        logo = Image.open(logo_file).convert("RGBA")
+        qr_width, qr_height = img.size
+        logo_max_size = int(qr_width * 0.24)
+        logo.thumbnail((logo_max_size, logo_max_size), Image.Resampling.LANCZOS)
+
+        pad = 8
+        bg_size = (logo.size[0] + pad * 2, logo.size[1] + pad * 2)
+        logo_bg = Image.new("RGBA", bg_size, rgb_fondo + (255,))
+
+        pos_bg = ((qr_width - bg_size[0]) // 2, (qr_height - bg_size[1]) // 2)
+        pos_logo = ((qr_width - logo.size[0]) // 2, (qr_height - logo.size[1]) // 2)
+
+        img.paste(logo_bg, pos_bg, logo_bg)
+        img.paste(logo, pos_logo, logo)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", dpi=(300, 300))
+    buf.seek(0)
+    return buf, img
+
+def generar_qr_svg(datos):
+    factory = qrcode.image.svg.SvgPathImage
+    img = qrcode.make(
+        datos,
+        image_factory=factory,
+        error_correction=qrcode.constants.ERROR_CORRECT_H,
+        box_size=10,
+        border=2
+    )
+    buf = io.BytesIO()
+    img.save(buf)
+    buf.seek(0)
+    return buf
+
+def generar_pdf_individual(png_buf, enlace_clicable=None, titulo_pie=""):
+    pdf = FPDF(orientation="P", unit="mm", format=(60, 65))
+    pdf.set_auto_page_break(False)
+    pdf.add_page()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+        tmp.write(png_buf.getvalue())
+        tmp_path = tmp.name
+
+    if enlace_clicable:
+        pdf.image(tmp_path, x=5, y=4, w=50, h=50, link=enlace_clicable)
+    else:
+        pdf.image(tmp_path, x=5, y=4, w=50, h=50)
+
+    os.remove(tmp_path)
+
+    if titulo_pie:
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_text_color(0, 49, 83)
+        pdf.set_xy(5, 56)
+        pdf.cell(50, 5, titulo_pie, align="C")
+
+    return bytes(pdf.output())
+
+def limpiar_texto_latin1(texto):
+    """Evita errores de codificación en FPDF estándar con acentos."""
+    return texto.encode("latin-1", "replace").decode("latin-1")
+
+def generar_pdf_doble_cara(png_vcard, png_interactivo, url_interactiva, nombre_completo, subtitulo, color_fondo_hex):
+    """Genera un PDF de 2 páginas (90 x 50 mm): Frente = vCard Offline | Reverso = QR Interactivo con enlaces."""
+    pdf = FPDF(orientation="L", unit="mm", format=(50, 90))
+    pdf.set_auto_page_break(False)
+
+    r, g, b = hex_to_rgb(color_fondo_hex)
+    t_r, t_g, t_b = (255, 255, 255) if (r * 0.299 + g * 0.587 + b * 0.114) < 128 else (0, 49, 83)
+
+    # --- PÁGINA 1: FRENTE (vCard Offline + Identidad) ---
+    pdf.add_page()
+    pdf.set_fill_color(r, g, b)
+    pdf.rect(0, 0, 90, 50, style="F")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp1:
+        tmp1.write(png_vcard.getvalue())
+        tmp1_path = tmp1.name
+
+    pdf.image(tmp1_path, x=8, y=9, w=32, h=32)
+    os.remove(tmp1_path)
+
+    pdf.set_text_color(t_r, t_g, t_b)
+    pdf.set_font("Helvetica", "B", 10.5)
+    pdf.set_xy(43, 15)
+    pdf.multi_cell(41, 5, limpiar_texto_latin1(nombre_completo), align="L")
+
+    pdf.set_font("Helvetica", "", 7.5)
+    pdf.set_xy(43, 27)
+    pdf.multi_cell(41, 4, limpiar_texto_latin1(subtitulo), align="L")
+
+    pdf.set_font("Helvetica", "B", 6)
+    pdf.set_xy(8, 42)
+    pdf.cell(32, 4, "GUARDAR CONTACTO", align="C")
+
+    # --- PÁGINA 2: REVERSO (QR Interactivo Centrado) ---
+    pdf.add_page()
+    pdf.set_fill_color(r, g, b)
+    pdf.rect(0, 0, 90, 50, style="F")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp2:
+        tmp2.write(png_interactivo.getvalue())
+        tmp2_path = tmp2.name
+
+    pdf.image(tmp2_path, x=28, y=6, w=34, h=34, link=url_interactiva)
+    os.remove(tmp2_path)
+
+    pdf.set_text_color(t_r, t_g, t_b)
+    pdf.set_font("Helvetica", "B", 6.5)
+    pdf.set_xy(10, 41.5)
+    pdf.cell(70, 4, "ESCANEA PARA LLAMAR, CORREO, WEB Y MAPA", align="C", link=url_interactiva)
+
+    return bytes(pdf.output())
+
+def generar_pdf_4qr(qrs_dict, uris_dict, color_fondo_hex):
+    """Genera un PDF tamaño tarjeta (90 x 50 mm) con los 4 QR individuales alineados."""
+    pdf = FPDF(orientation="L", unit="mm", format=(50, 90))
+    pdf.set_auto_page_break(False)
+    pdf.add_page()
+
+    r, g, b = hex_to_rgb(color_fondo_hex)
+    pdf.set_fill_color(r, g, b)
+    pdf.rect(0, 0, 90, 50, style="F")
+
+    qr_size = 17.5
+    gap = 3.5
+    start_x = (90 - (4 * qr_size + 3 * gap)) / 2
+    y_pos = 13.5
+
+    etiquetas = ["LLAMAR", "CORREO", "WEB", "UBICACION"]
+    claves = ["tel", "email", "web", "map"]
+
+    pdf.set_font("Helvetica", "B", 6.5)
+    t_r, t_g, t_b = (255, 255, 255) if (r * 0.299 + g * 0.587 + b * 0.114) < 128 else (0, 49, 83)
+    pdf.set_text_color(t_r, t_g, t_b)
+
+    for idx, clave in enumerate(claves):
+        if clave in qrs_dict:
+            x = start_x + idx * (qr_size + gap)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
+                tmp.write(qrs_dict[clave].getvalue())
+                tmp_path = tmp.name
+
+            pdf.image(tmp_path, x=x, y=y_pos, w=qr_size, h=qr_size, link=uris_dict.get(clave, ""))
+            os.remove(tmp_path)
+
+            pdf.set_xy(x, y_pos + qr_size + 1.5)
+            pdf.cell(qr_size, 4, etiquetas[idx], align="C", link=uris_dict.get(clave, ""))
+
+    return bytes(pdf.output())
+
+# --- BARRA LATERAL: ESTILO Y LOGO ---
+with st.sidebar:
+    st.header("🎨 Estilo Visual")
+    color_frente = st.color_picker("Color del código QR", "#003153")
+    color_fondo = st.color_picker("Color de fondo", "#FAF3E6")
+    estilo_redondo = st.checkbox("Módulos redondeados", value=False)
+
+    st.markdown("---")
+    st.subheader("🖼️ Logotipo Central (Opcional)")
+    logo_subido = st.file_uploader("Sube isotipo TONAL o escudo (PNG/JPG)", type=["png", "jpg", "jpeg"])
+    if logo_subido:
+        st.image(logo_subido, width=90, caption="Logo activo")
+
+    st.markdown("---")
+    st.caption("Sugerencia láser: Usa negro (#000000) sobre blanco (#FFFFFF) y descarga el archivo SVG.")
+
+# --- ENCABEZADO PRINCIPAL ---
+st.title("Generador Multipropósito de Códigos QR")
+st.markdown("Crea códigos para tarjetas de presentación (vCard, Tarjeta Digital y Enlaces Directos) y etiquetas de laboratorio.")
+
+# --- PESTAÑAS DE MODOS ---
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📇 1. Contacto (vCard + Digital + 4 Enlaces)",
+    "🧪 2. Reactivos / Lotes / Texto",
+    "📶 3. Acceso Wi-Fi",
+    "💬 4. WhatsApp y 📅 Evento"
+])
+
+# ==============================================================================
+# PESTAÑA 1: CONTACTO (vCard + QR INTERACTIVO + 4 QR INDIVIDUALES)
+# ==============================================================================
+with tab1:
+    st.subheader("Datos del Contacto")
+
+    url_app_publica = st.text_input(
+        "🌐 URL pública de tu aplicación en Streamlit Cloud (necesaria para el QR Único Interactivo):",
+        value="https://generador-qr.streamlit.app",
+        help="Cuando subas esta app a Streamlit Community Cloud, pega aquí su dirección web exacta."
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        nombre = st.text_input("Nombre(s)", value="Fernando")
+        apellidos = st.text_input("Apellidos", value="López Barrera")
+        titulo = st.text_input("Puesto / Título / Marca", value="Nutriólogo")
+        empresa = st.text_input("Institución / Organización", value="Instituto de Neurobiología, UNAM")
+    with col2:
+        telefono = st.text_input("Teléfono (10 dígitos o con +52)", value="4422381028")
+        correo = st.text_input("Correo electrónico", value="lopezbfe@unam.mx")
+        web = st.text_input("Sitio Web / Portafolio", value="https://www.inb.unam.mx")
+
+    st.markdown("**Dirección física:**")
+    cd1, cd2, cd3, cd4 = st.columns([2, 1, 1, 1])
+    with cd1:
+        calle = st.text_input("Calle y número", value="Campus Juriquilla, Blvd. Juriquilla 3001")
+    with cd2:
+        ciudad = st.text_input("Ciudad / Localidad", value="Querétaro")
+    with cd3:
+        estado = st.text_input("Estado", value="Qro.")
+    with cd4:
+        cp = st.text_input("C.P.", value="76230")
+
+    if st.button("Generar Todos los Códigos de Contacto", key="btn_contacto"):
+        st.markdown("---")
+
+        # Normalizar teléfono
+        tel_digits = "".join(c for c in telefono if c.isdigit())
+        if len(tel_digits) == 10:
+            tel_clean = f"+52{tel_digits}"
+        elif telefono.strip().startswith("+"):
+            tel_clean = "+" + tel_digits
+        else:
+            tel_clean = f"+{tel_digits}"
+
+        uri_web = web.strip() if web.strip().startswith("http") else f"https://{web.strip()}"
+        direccion_completa = f"{calle.strip()}, {ciudad.strip()}, {estado.strip()}, {cp.strip()}, México"
+
+        # 1. Cadena vCard 3.0 (Offline)
+        vcard_lines = [
+            "BEGIN:VCARD",
+            "VERSION:3.0",
+            f"N;CHARSET=UTF-8:{apellidos.strip()};{nombre.strip()};;;",
+            f"FN;CHARSET=UTF-8:{nombre.strip()} {apellidos.strip()}",
+            f"ORG;CHARSET=UTF-8:{empresa.strip()}",
+            f"TITLE;CHARSET=UTF-8:{titulo.strip()}",
+            f"TEL;TYPE=WORK,VOICE:{tel_clean}",
+            f"EMAIL;TYPE=WORK,INTERNET:{correo.strip()}",
+            f"URL:{uri_web}",
+            f"ADR;TYPE=WORK;CHARSET=UTF-8:;;{calle.strip()};{ciudad.strip()};{estado.strip()};{cp.strip()};México",
+            "END:VCARD"
+        ]
+        vcard_str = "\n".join(vcard_lines)
+
+        # 2. URL Tarjeta Digital Interactiva (Online con botones clicables)
+        base_clean = url_app_publica.strip().rstrip("/")
+        query_params = urllib.parse.urlencode({
+            "vista": "tarjeta",
+            "n": nombre.strip(),
+            "a": apellidos.strip(),
+            "t": titulo.strip(),
+            "e": empresa.strip(),
+            "tel": tel_clean,
+            "mail": correo.strip(),
+            "web": uri_web,
+            "dir": direccion_completa
+        })
+        url_tarjeta_interactiva = f"{base_clean}/?{query_params}"
+
+        # 3. Enlaces individuales
+        uri_tel = f"tel:{tel_clean}"
+        uri_email = f"mailto:{correo.strip()}?subject={urllib.parse.quote('Contacto desde tarjeta QR')}"
+        uri_map = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(direccion_completa)}"
+
+        # --- BLOQUE A Y B EN DOS COLUMNAS: vCard vs QR INTERACTIVO ---
+        col_vc, col_int = st.columns(2)
+
+        with col_vc:
+            st.markdown("### A. QR vCard (Guardar en Agenda - Offline)")
+            png_vcard, _ = generar_qr_png(vcard_str, color_frente, color_fondo, logo_subido, estilo_redondo)
+            svg_vcard = generar_qr_svg(vcard_str)
+            pdf_vcard = generar_pdf_individual(png_vcard, titulo_pie=f"{nombre} {apellidos}")
+
+            st.image(png_vcard, width=210)
+            st.caption("Ideal para el **frente** de tu tarjeta: funciona sin internet y abre la agenda del teléfono.")
+            bv1, bv2, bv3 = st.columns(3)
+            with bv1:
+                st.download_button("⬇️ PNG", png_vcard, file_name="QR_vCard.png", mime="image/png", key="vc_png")
+            with bv2:
+                st.download_button("⬇️ PDF", pdf_vcard, file_name="QR_vCard.pdf", mime="application/pdf", key="vc_pdf")
+            with bv3:
+                st.download_button("⬇️ SVG", svg_vcard, file_name="QR_vCard.svg", mime="image/svg+xml", key="vc_svg")
+
+        with col_int:
+            st.markdown("### B. QR Interactivo (Botones de Acción - Online)")
+            png_inter, _ = generar_qr_png(url_tarjeta_interactiva, color_frente, color_fondo, logo_subido, estilo_redondo)
+            svg_inter = generar_qr_svg(url_tarjeta_interactiva)
+            pdf_inter = generar_pdf_individual(png_inter, enlace_clicable=url_tarjeta_interactiva, titulo_pie="TARJETA DIGITAL")
+
+            st.image(png_inter, width=210)
+            st.caption("Ideal para el **reverso** de tu tarjeta: abre una pantalla con botones directos para Llamar, Correo, Web y Mapa.")
+            bi1, bi2, bi3 = st.columns(3)
+            with bi1:
+                st.download_button("⬇️ PNG", png_inter, file_name="QR_Tarjeta_Digital.png", mime="image/png", key="in_png")
+            with bi2:
+                st.download_button("⬇️ PDF", pdf_inter, file_name="QR_Tarjeta_Digital.pdf", mime="application/pdf", key="in_pdf")
+            with bi3:
+                st.download_button("⬇️ SVG", svg_inter, file_name="QR_Tarjeta_Digital.svg", mime="image/svg+xml", key="in_svg")
+            st.markdown(f"[🔗 Probar vista de Tarjeta Digital en navegador]({url_tarjeta_interactiva})")
+
+        st.markdown("---")
+
+        # --- BLOQUE C: 4 CÓDIGOS INDIVIDUALES ---
+        st.markdown("### C. Cuatro Códigos Individuales (Para envíos puntuales por correo/WhatsApp)")
+
+        items_indiv = [
+            ("tel", "📞 Llamada Directa", uri_tel, "QR_Llamada", "LLAMAR"),
+            ("email", "✉️ Enviar Correo", uri_email, "QR_Correo", "CORREO"),
+            ("web", "🌐 Abrir Sitio Web", uri_web, "QR_Web", "SITIO WEB"),
+            ("map", "📍 Ubicación Mapa", uri_map, "QR_Mapa", "UBICACION"),
+        ]
+
+        cols_4 = st.columns(4)
+        qrs_para_pdf = {}
+        uris_para_pdf = {}
+
+        for i, (clave, titulo_card, uri, fname, etiqueta_pdf) in enumerate(items_indiv):
+            png_buf, _ = generar_qr_png(uri, color_frente, color_fondo, logo_subido, estilo_redondo)
+            svg_buf = generar_qr_svg(uri)
+            pdf_indiv = generar_pdf_individual(png_buf, enlace_clicable=uri, titulo_pie=etiqueta_pdf)
+
+            qrs_para_pdf[clave] = png_buf
+            uris_para_pdf[clave] = uri
+
+            with cols_4[i]:
+                st.markdown(f"**{titulo_card}**")
+                st.image(png_buf, use_container_width=True)
+                st.download_button("⬇️ PNG", png_buf, file_name=f"{fname}.png", mime="image/png", key=f"dl_png_{clave}")
+                st.download_button("⬇️ PDF", pdf_indiv, file_name=f"{fname}.pdf", mime="application/pdf", key=f"dl_pdf_{clave}")
+                st.download_button("⬇️ SVG", svg_buf, file_name=f"{fname}.svg", mime="image/svg+xml", key=f"dl_svg_{clave}")
+
+        st.markdown("---")
+
+        # --- BLOQUE D: PLANTILLAS PDF LISTAS PARA IMPRIMIR (9 x 5 CM) ---
+        st.markdown("### D. Plantillas PDF Listas para Imprimir (9 × 5 cm)")
+        cpdf1, cpdf2 = st.columns(2)
+
+        with cpdf1:
+            pdf_doble = generar_pdf_doble_cara(
+                png_vcard,
+                png_inter,
+                url_tarjeta_interactiva,
+                f"{nombre.strip()} {apellidos.strip()}",
+                f"{titulo.strip()}\n{empresa.strip()}",
+                color_fondo
+            )
+            st.download_button(
+                label="🖨️ PDF Tarjeta Doble Cara (Frente: vCard | Reverso: QR Interactivo)",
+                data=pdf_doble,
+                file_name="Tarjeta_Doble_Cara_9x5cm.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
+
+        with cpdf2:
+            pdf_4 = generar_pdf_4qr(qrs_para_pdf, uris_para_pdf, color_fondo)
+            st.download_button(
+                label="🖨️ PDF Tarjeta 1 Cara (4 QR Individuales Alineados 9x5 cm)",
+                data=pdf_4,
+                file_name="Tarjeta_4QR_9x5cm.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
+
+# ==============================================================================
+# PESTAÑA 2: TEXTO LIBRE / REACTIVOS / LOTES
+# ==============================================================================
+with tab2:
+    st.subheader("Etiquetado de Laboratorio, Reactivos o Información General")
+    modo_lab = st.radio("Formato de entrada:", ["Plantilla rápida de Reactivo / Muestra", "Texto libre personalizado"], horizontal=True)
+
+    if modo_lab == "Plantilla rápida de Reactivo / Muestra":
+        cl1, cl2 = st.columns(2)
+        with cl1:
+            reactivo = st.text_input("Nombre del Reactivo / Lote de Muestras", placeholder="Ej. Paraformaldehído 4% en PBS")
+            concentracion = st.text_input("Concentración / Especificación", placeholder="Ej. pH 7.4 | Lote #2026-11")
+            almacenamiento = st.text_input("Condiciones de almacenamiento", placeholder="Ej. 4 °C - Proteger de la luz")
+        with cl2:
+            fecha_prep = st.text_input("Fecha de preparación / ingreso", placeholder="Ej. 18/Nov/2026")
+            fecha_cad = st.text_input("Caducidad / Revisión", placeholder="Ej. 18/Dic/2026")
+            responsable = st.text_input("Responsable / Notas", value="Lab. Investigación - F. López")
+
+        texto_codificar = (
+            f"REACTIVO/LOTE: {reactivo}\n"
+            f"SPEC: {concentracion}\n"
+            f"PREP: {fecha_prep} | CAD: {fecha_cad}\n"
+            f"ALMACEN: {almacenamiento}\n"
+            f"RESP: {responsable}"
+        )
+    else:
+        texto_codificar = st.text_area(
+            "Escribe o pega el texto exacto que aparecerá al escanear:",
+            height=150,
+            placeholder="Escribe aquí notas técnicas, instrucciones de uso, serie de pieza o descripción detallada..."
+        )
+
+    if st.button("Generar QR de Texto / Etiqueta", key="btn_texto"):
+        if texto_codificar.strip():
+            png_txt, _ = generar_qr_png(texto_codificar, color_frente, color_fondo, logo_subido, estilo_redondo)
+            svg_txt = generar_qr_svg(texto_codificar)
+            pdf_txt = generar_pdf_individual(png_txt, titulo_pie="ETIQUETA QR")
+
+            ct1, ct2 = st.columns([1, 2])
+            with ct1:
+                st.image(png_txt, width=230)
+            with ct2:
+                st.code(texto_codificar, language="text")
+                st.download_button("⬇️ Descargar PNG", png_txt, file_name="QR_Etiqueta.png", mime="image/png")
+                st.download_button("⬇️ Descargar PDF", pdf_txt, file_name="QR_Etiqueta.pdf", mime="application/pdf")
+                st.download_button("⬇️ Descargar SVG", svg_txt, file_name="QR_Etiqueta.svg", mime="image/svg+xml")
+        else:
+            st.warning("Ingresa algún texto antes de generar el código.")
+
+# ==============================================================================
+# PESTAÑA 3: ACCESO WI-FI
+# ==============================================================================
+with tab3:
+    st.subheader("Conexión Automática a Red Wi-Fi")
+    cw1, cw2, cw3 = st.columns(3)
+    with cw1:
+        ssid = st.text_input("Nombre de la red (SSID)")
+    with cw2:
+        password = st.text_input("Contraseña", type="password")
+    with cw3:
+        seguridad = st.selectbox("Tipo de seguridad", ["WPA", "WEP", "nopass"])
+
+    if st.button("Generar QR Wi-Fi", key="btn_wifi"):
+        if ssid:
+            wifi_str = f"WIFI:T:{seguridad};S:{ssid};P:{password};;"
+            png_wifi, _ = generar_qr_png(wifi_str, color_frente, color_fondo, logo_subido, estilo_redondo)
+            svg_wifi = generar_qr_svg(wifi_str)
+            pdf_wifi = generar_pdf_individual(png_wifi, titulo_pie=f"Wi-Fi: {ssid}")
+
+            st.image(png_wifi, width=220)
+            st.download_button("⬇️ Descargar PNG", png_wifi, file_name=f"QR_WiFi_{ssid}.png", mime="image/png")
+            st.download_button("⬇️ Descargar PDF", pdf_wifi, file_name=f"QR_WiFi_{ssid}.pdf", mime="application/pdf")
+            st.download_button("⬇️ Descargar SVG", svg_wifi, file_name=f"QR_WiFi_{ssid}.svg", mime="image/svg+xml")
+
+# ==============================================================================
+# PESTAÑA 4: WHATSAPP Y EVENTO DE CALENDARIO
+# ==============================================================================
+with tab4:
+    col_wa, col_cal = st.columns(2)
+
+    with col_wa:
+        st.subheader("💬 Chat Directo de WhatsApp")
+        wa_num = st.text_input("Número WhatsApp (10 dígitos o con 52)", value="4422381028")
+        wa_msg = st.text_area("Mensaje predeterminado al abrir chat", value="Hola, te contacto respecto a...")
+        if st.button("Generar QR WhatsApp"):
+            num_limpio = "".join(c for c in wa_num if c.isdigit())
+            if len(num_limpio) == 10:
+                num_limpio = f"52{num_limpio}"
+            wa_url = f"https://wa.me/{num_limpio}?text={urllib.parse.quote(wa_msg)}"
+            png_wa, _ = generar_qr_png(wa_url, color_frente, color_fondo, logo_subido, estilo_redondo)
+            pdf_wa = generar_pdf_individual(png_wa, enlace_clicable=wa_url, titulo_pie="WHATSAPP")
+
+            st.image(png_wa, width=200)
+            st.download_button("⬇️ Descargar PNG", png_wa, file_name="QR_WhatsApp.png", mime="image/png")
+            st.download_button("⬇️ Descargar PDF", pdf_wa, file_name="QR_WhatsApp.pdf", mime="application/pdf")
+
+    with col_cal:
+        st.subheader("📅 Evento de Calendario")
+        ev_titulo = st.text_input("Título del evento / seminario", value="Seminario de Investigación")
+        ev_lugar = st.text_input("Lugar / Aula / Enlace Zoom", value="Auditorio Instituto")
+        c_f1, c_f2 = st.columns(2)
+        with c_f1:
+            ev_inicio = st.text_input("Inicio (AAAAMMDDTHHMMSS)", value="20261125T100000")
+        with c_f2:
+            ev_fin = st.text_input("Fin (AAAAMMDDTHHMMSS)", value="20261125T113000")
+
+        if st.button("Generar QR Evento"):
+            ics_str = (
+                f"BEGIN:VCALENDAR\n"
+                f"VERSION:2.0\n"
+                f"BEGIN:VEVENT\n"
+                f"SUMMARY:{ev_titulo}\n"
+                f"LOCATION:{ev_lugar}\n"
+                f"DTSTART:{ev_inicio}\n"
+                f"DTEND:{ev_fin}\n"
+                f"END:VEVENT\n"
+                f"END:VCALENDAR"
+            )
+            png_ev, _ = generar_qr_png(ics_str, color_frente, color_fondo, logo_subido, estilo_redondo)
+            pdf_ev = generar_pdf_individual(png_ev, titulo_pie=ev_titulo[:22])
+
+            st.image(png_ev, width=200)
+            st.download_button("⬇️ Descargar PNG", png_ev, file_name="QR_Evento.png", mime="image/png")
+            st.download_button("⬇️ Descargar PDF", pdf_ev, file_name="QR_Evento.pdf", mime="application/pdf")
