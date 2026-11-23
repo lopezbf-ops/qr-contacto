@@ -24,6 +24,18 @@ st.set_page_config(
     layout="wide"
 )
 
+# --- DETECCIÓN AUTOMÁTICA DE LA URL DE LA APLICACIÓN ---
+def obtener_url_base():
+    """Detecta automáticamente la dirección web real donde está corriendo la app."""
+    try:
+        host = st.context.headers.get("Host", "")
+        if host:
+            protocolo = "http" if ("localhost" in host or "127.0.0.1" in host) else "https"
+            return f"{protocolo}://{host}"
+    except Exception:
+        pass
+    return ""
+
 # --- ESTILOS CSS PERSONALIZADOS ---
 st.markdown("""
     <style>
@@ -85,7 +97,7 @@ def normalizar_url_imagen(url):
     return url
 
 def optimizar_raster(file_bytes, filename):
-    """Redimensiona imágenes muy grandes (ej. 300ppp) a máx 1600px para carga rápida en móvil."""
+    """Redimensiona imágenes muy grandes a máx 1600px para carga rápida en móvil."""
     img = Image.open(io.BytesIO(file_bytes))
     max_dim = 1600
     if max(img.size) > max_dim:
@@ -137,16 +149,13 @@ def subir_imagen_automatica(uploaded_file):
     is_svg = fname.lower().endswith(".svg")
 
     if is_svg:
-        # Si el SVG es ligero, se comprime directo en la URL sin depender de servidores externos
         comprimido = zlib.compress(raw_bytes, level=9)
         b64_zlib = base64.urlsafe_b64encode(comprimido).decode("ascii")
         if len(b64_zlib) <= 1750:
             return {"tipo": "svg_inline", "data": b64_zlib}
-        # Si es un SVG pesado, se aloja en la nube
         url_remota = subir_a_catbox(raw_bytes, "tarjeta.svg", "image/svg+xml")
         return {"tipo": "url", "data": url_remota}
 
-    # Para JPG / PNG: optimizar resolución y alojar
     opt_bytes, opt_name, mime = optimizar_raster(raw_bytes, fname)
     try:
         b64_img = base64.b64encode(opt_bytes).decode("ascii")
@@ -168,7 +177,6 @@ def subir_imagen_automatica(uploaded_file):
     except Exception:
         pass
 
-    # Respaldo automático si el primer servidor no responde
     url_remota = subir_a_catbox(opt_bytes, opt_name, mime)
     return {"tipo": "url", "data": url_remota}
 
@@ -488,6 +496,8 @@ def generar_pdf_4qr(qrs_dict, uris_dict, color_fondo_hex):
     return bytes(pdf.output())
 
 # --- BARRA LATERAL: ESTILO Y LOGO ---
+url_detectada = obtener_url_base()
+
 with st.sidebar:
     st.header("🎨 Estilo Visual")
     color_frente = st.color_picker("Color del código QR", "#003153")
@@ -501,11 +511,11 @@ with st.sidebar:
         st.image(logo_subido, width=90, caption="Logo activo")
 
     st.markdown("---")
-    st.subheader("🌐 URL Base de la App")
+    st.subheader("🌐 Dirección Web Detectada")
     url_app_publica = st.text_input(
-        "Enlace en Streamlit Cloud:",
-        value="https://generarqr-kjz2ocyjdfvxx6eobh9y84.streamlit.app",
-        help="Se usa automáticamente para el QR Interactivo y el QR de Imagen."
+        "URL base de esta aplicación:",
+        value=url_detectada,
+        help="Se detecta automáticamente al abrir la página en Streamlit."
     )
 
 # --- ENCABEZADO PRINCIPAL ---
@@ -645,266 +655,4 @@ with tab1:
         qrs_para_pdf = {}
         uris_para_pdf = {}
 
-        for i, (clave, titulo_card, uri, fname, etiqueta_pdf) in enumerate(items_indiv):
-            png_buf, _ = generar_qr_png(uri, color_frente, color_fondo, logo_subido, estilo_redondo)
-            svg_buf = generar_qr_svg(uri)
-            pdf_indiv = generar_pdf_individual(png_buf, enlace_clicable=uri, titulo_pie=etiqueta_pdf)
-
-            qrs_para_pdf[clave] = png_buf
-            uris_para_pdf[clave] = uri
-
-            with cols_4[i]:
-                st.markdown(f"**{titulo_card}**")
-                st.image(png_buf, use_container_width=True)
-                st.download_button("⬇️ PNG", png_buf, file_name=f"{fname}.png", mime="image/png", key=f"dl_png_{clave}")
-                st.download_button("⬇️ PDF", pdf_indiv, file_name=f"{fname}.pdf", mime="application/pdf", key=f"dl_pdf_{clave}")
-                st.download_button("⬇️ SVG", svg_buf, file_name=f"{fname}.svg", mime="image/svg+xml", key=f"dl_svg_{clave}")
-
-        st.markdown("---")
-        st.markdown("### D. Plantillas PDF Listas para Imprimir (9 × 5 cm)")
-        cpdf1, cpdf2 = st.columns(2)
-
-        with cpdf1:
-            pdf_doble = generar_pdf_doble_cara(
-                png_vcard,
-                png_inter,
-                url_tarjeta_interactiva,
-                f"{nombre.strip()} {apellidos.strip()}",
-                f"{titulo.strip()}\n{empresa.strip()}",
-                color_fondo
-            )
-            st.download_button(
-                label="🖨️ PDF Tarjeta Doble Cara (Frente: vCard | Reverso: QR Interactivo)",
-                data=pdf_doble,
-                file_name="Tarjeta_Doble_Cara_9x5cm.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-
-        with cpdf2:
-            pdf_4 = generar_pdf_4qr(qrs_para_pdf, uris_para_pdf, color_fondo)
-            st.download_button(
-                label="🖨️ PDF Tarjeta 1 Cara (4 QR Individuales Alineados 9x5 cm)",
-                data=pdf_4,
-                file_name="Tarjeta_4QR_9x5cm.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
-
-# ==============================================================================
-# PESTAÑA 2: TARJETA EN IMAGEN (SUBIDA DIRECTA DE JPG, PNG O SVG)
-# ==============================================================================
-with tab2:
-    st.subheader("Generar Código QR a partir de una Tarjeta en Imagen")
-    st.markdown("Sube el archivo de tu tarjeta diseñada (**JPG, PNG o SVG**). Al escanear el QR, se mostrará tu diseño en el teléfono con opción para descargarlo.")
-
-    archivo_tarjeta = st.file_uploader(
-        "Selecciona o arrastra tu tarjeta de presentación:",
-        type=["jpg", "jpeg", "png", "svg"],
-        key="uploader_tarjeta_img"
-    )
-
-    titulo_imagen_input = st.text_input(
-        "Título opcional arriba de la tarjeta (puedes dejarlo en blanco):",
-        placeholder="Ej. Fernando López Barrera | TONAL",
-        key="titulo_tarjeta_img"
-    )
-
-    # Vista previa inmediata del archivo subido
-    if archivo_tarjeta is not None:
-        st.caption(f"Archivo cargado: **{archivo_tarjeta.name}**")
-        if archivo_tarjeta.name.lower().endswith(".svg"):
-            svg_prev_b64 = base64.b64encode(archivo_tarjeta.getvalue()).decode("ascii")
-            st.markdown(
-                f'<img src="data:image/svg+xml;base64,{svg_prev_b64}" style="max-width:360px; border-radius:8px; border:1px solid #CCC;" />',
-                unsafe_allow_html=True
-            )
-        else:
-            st.image(archivo_tarjeta, width=360)
-
-    with st.expander("Opcional: Usar un enlace externo (GitHub o Google Drive) en lugar de subir archivo"):
-        url_imagen_externa = st.text_input(
-            "Enlace web de la imagen:",
-            placeholder="https://...",
-            key="url_ext_img"
-        )
-
-    if st.button("Generar QR de la Tarjeta", key="btn_imagen"):
-        base_clean = url_app_publica.strip().rstrip("/")
-        url_visor_final = None
-
-        if archivo_tarjeta is not None:
-            with st.spinner("Preparando tarjeta y generando código QR..."):
-                try:
-                    res = subir_imagen_automatica(archivo_tarjeta)
-                    if res["tipo"] == "svg_inline":
-                        q_params = urllib.parse.urlencode({
-                            "vista": "svg",
-                            "d": res["data"],
-                            "titulo": titulo_imagen_input.strip()
-                        })
-                    else:
-                        q_params = urllib.parse.urlencode({
-                            "vista": "imagen",
-                            "img": res["data"],
-                            "titulo": titulo_imagen_input.strip()
-                        })
-                    url_visor_final = f"{base_clean}/?{q_params}"
-                except Exception as e:
-                    st.error(f"No se pudo procesar la imagen automáticamente: {e}")
-
-        elif url_imagen_externa.strip():
-            url_img_limpia = normalizar_url_imagen(url_imagen_externa)
-            q_params = urllib.parse.urlencode({
-                "vista": "imagen",
-                "img": url_img_limpia,
-                "titulo": titulo_imagen_input.strip()
-            })
-            url_visor_final = f"{base_clean}/?{q_params}"
-        else:
-            st.warning("Sube primero una imagen (JPG, PNG o SVG) para generar el código QR.")
-
-        if url_visor_final:
-            png_img_qr, _ = generar_qr_png(url_visor_final, color_frente, color_fondo, logo_subido, estilo_redondo)
-            svg_img_qr = generar_qr_svg(url_visor_final)
-            pdf_img_qr = generar_pdf_individual(png_img_qr, enlace_clicable=url_visor_final, titulo_pie="VER TARJETA")
-
-            st.markdown("---")
-            ci1, ci2 = st.columns([1, 2])
-            with ci1:
-                st.image(png_img_qr, width=220)
-            with ci2:
-                st.success("¡Código QR listo! Al escanearlo mostrará tu tarjeta y permitirá guardarla en el teléfono.")
-                st.markdown(f"[🔗 Probar cómo se verá en el teléfono]({url_visor_final})")
-                bi1, bi2, bi3 = st.columns(3)
-                with bi1:
-                    st.download_button("⬇️ PNG (300ppp)", png_img_qr, file_name="QR_Tarjeta_Imagen.png", mime="image/png", key="img_png")
-                with bi2:
-                    st.download_button("⬇️ PDF Clicable", pdf_img_qr, file_name="QR_Tarjeta_Imagen.pdf", mime="application/pdf", key="img_pdf")
-                with bi3:
-                    st.download_button("⬇️ SVG Láser", svg_img_qr, file_name="QR_Tarjeta_Imagen.svg", mime="image/svg+xml", key="img_svg")
-
-# ==============================================================================
-# PESTAÑA 3: TEXTO LIBRE / REACTIVOS / LOTES
-# ==============================================================================
-with tab3:
-    st.subheader("Etiquetado de Laboratorio, Reactivos o Información General")
-    modo_lab = st.radio("Formato de entrada:", ["Plantilla rápida de Reactivo / Muestra", "Texto libre personalizado"], horizontal=True)
-
-    if modo_lab == "Plantilla rápida de Reactivo / Muestra":
-        cl1, cl2 = st.columns(2)
-        with cl1:
-            reactivo = st.text_input("Nombre del Reactivo / Lote de Muestras", placeholder="Ej. Paraformaldehído 4% en PBS")
-            concentracion = st.text_input("Concentración / Especificación", placeholder="Ej. pH 7.4 | Lote #2026-11")
-            almacenamiento = st.text_input("Condiciones de almacenamiento", placeholder="Ej. 4 °C - Proteger de la luz")
-        with cl2:
-            fecha_prep = st.text_input("Fecha de preparación / ingreso", placeholder="Ej. 23/Nov/2026")
-            fecha_cad = st.text_input("Caducidad / Revisión", placeholder="Ej. 23/Dic/2026")
-            responsable = st.text_input("Responsable / Notas", value="Lab. Investigación - F. López")
-
-        texto_codificar = (
-            f"REACTIVO/LOTE: {reactivo}\n"
-            f"SPEC: {concentracion}\n"
-            f"PREP: {fecha_prep} | CAD: {fecha_cad}\n"
-            f"ALMACEN: {almacenamiento}\n"
-            f"RESP: {responsable}"
-        )
-    else:
-        texto_codificar = st.text_area(
-            "Escribe o pega el texto exacto que aparecerá al escanear:",
-            height=150,
-            placeholder="Escribe aquí notas técnicas, instrucciones de uso, serie de pieza o descripción detallada..."
-        )
-
-    if st.button("Generar QR de Texto / Etiqueta", key="btn_texto"):
-        if texto_codificar.strip():
-            png_txt, _ = generar_qr_png(texto_codificar, color_frente, color_fondo, logo_subido, estilo_redondo)
-            svg_txt = generar_qr_svg(texto_codificar)
-            pdf_txt = generar_pdf_individual(png_txt, titulo_pie="ETIQUETA QR")
-
-            ct1, ct2 = st.columns([1, 2])
-            with ct1:
-                st.image(png_txt, width=230)
-            with ct2:
-                st.code(texto_codificar, language="text")
-                st.download_button("⬇️ Descargar PNG", png_txt, file_name="QR_Etiqueta.png", mime="image/png")
-                st.download_button("⬇️ Descargar PDF", pdf_txt, file_name="QR_Etiqueta.pdf", mime="application/pdf")
-                st.download_button("⬇️ Descargar SVG", svg_txt, file_name="QR_Etiqueta.svg", mime="image/svg+xml")
-        else:
-            st.warning("Ingresa algún texto antes de generar el código.")
-
-# ==============================================================================
-# PESTAÑA 4: ACCESO WI-FI
-# ==============================================================================
-with tab4:
-    st.subheader("Conexión Automática a Red Wi-Fi")
-    cw1, cw2, cw3 = st.columns(3)
-    with cw1:
-        ssid = st.text_input("Nombre de la red (SSID)")
-    with cw2:
-        password = st.text_input("Contraseña", type="password")
-    with cw3:
-        seguridad = st.selectbox("Tipo de seguridad", ["WPA", "WEP", "nopass"])
-
-    if st.button("Generar QR Wi-Fi", key="btn_wifi"):
-        if ssid:
-            wifi_str = f"WIFI:T:{seguridad};S:{ssid};P:{password};;"
-            png_wifi, _ = generar_qr_png(wifi_str, color_frente, color_fondo, logo_subido, estilo_redondo)
-            svg_wifi = generar_qr_svg(wifi_str)
-            pdf_wifi = generar_pdf_individual(png_wifi, titulo_pie=f"Wi-Fi: {ssid}")
-
-            st.image(png_wifi, width=220)
-            st.download_button("⬇️ Descargar PNG", png_wifi, file_name=f"QR_WiFi_{ssid}.png", mime="image/png")
-            st.download_button("⬇️ Descargar PDF", pdf_wifi, file_name=f"QR_WiFi_{ssid}.pdf", mime="application/pdf")
-            st.download_button("⬇️ Descargar SVG", svg_wifi, file_name=f"QR_WiFi_{ssid}.svg", mime="image/svg+xml")
-
-# ==============================================================================
-# PESTAÑA 5: WHATSAPP Y EVENTO DE CALENDARIO
-# ==============================================================================
-with tab5:
-    col_wa, col_cal = st.columns(2)
-
-    with col_wa:
-        st.subheader("💬 Chat Directo de WhatsApp")
-        wa_num = st.text_input("Número WhatsApp (10 dígitos o con 52)", value="4422381028")
-        wa_msg = st.text_area("Mensaje predeterminado al abrir chat", value="Hola, te contacto respecto a...")
-        if st.button("Generar QR WhatsApp"):
-            num_limpio = "".join(c for c in wa_num if c.isdigit())
-            if len(num_limpio) == 10:
-                num_limpio = f"52{num_limpio}"
-            wa_url = f"https://wa.me/{num_limpio}?text={urllib.parse.quote(wa_msg)}"
-            png_wa, _ = generar_qr_png(wa_url, color_frente, color_fondo, logo_subido, estilo_redondo)
-            pdf_wa = generar_pdf_individual(png_wa, enlace_clicable=wa_url, titulo_pie="WHATSAPP")
-
-            st.image(png_wa, width=200)
-            st.download_button("⬇️ Descargar PNG", png_wa, file_name="QR_WhatsApp.png", mime="image/png")
-            st.download_button("⬇️ Descargar PDF", pdf_wa, file_name="QR_WhatsApp.pdf", mime="application/pdf")
-
-    with col_cal:
-        st.subheader("📅 Evento de Calendario")
-        ev_titulo = st.text_input("Título del evento / seminario", value="Seminario de Investigación")
-        ev_lugar = st.text_input("Lugar / Aula / Enlace Zoom", value="Auditorio Instituto")
-        c_f1, c_f2 = st.columns(2)
-        with c_f1:
-            ev_inicio = st.text_input("Inicio (AAAAMMDDTHHMMSS)", value="20261125T100000")
-        with c_f2:
-            ev_fin = st.text_input("Fin (AAAAMMDDTHHMMSS)", value="20261125T113000")
-
-        if st.button("Generar QR Evento"):
-            ics_str = (
-                f"BEGIN:VCALENDAR\n"
-                f"VERSION:2.0\n"
-                f"BEGIN:VEVENT\n"
-                f"SUMMARY:{ev_titulo}\n"
-                f"LOCATION:{ev_lugar}\n"
-                f"DTSTART:{ev_inicio}\n"
-                f"DTEND:{ev_fin}\n"
-                f"END:VEVENT\n"
-                f"END:VCALENDAR"
-            )
-            png_ev, _ = generar_qr_png(ics_str, color_frente, color_fondo, logo_subido, estilo_redondo)
-            pdf_ev = generar_pdf_individual(png_ev, titulo_pie=ev_titulo[:22])
-
-            st.image(png_ev, width=200)
-            st.download_button("⬇️ Descargar PNG", png_ev, file_name="QR_Evento.png", mime="image/png")
-            st.download_button("⬇️ Descargar PDF", pdf_ev, file_name="QR_Evento.pdf", mime="application/pdf")
+        for i, (clave, titulo_card, uri, fname, etiqueta
