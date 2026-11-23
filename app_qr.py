@@ -7,9 +7,15 @@ import qrcode.image.svg
 from PIL import Image
 import io
 import urllib.parse
+import urllib.request
 from fpdf import FPDF
 import tempfile
 import os
+import re
+import base64
+import zlib
+import json
+import uuid
 
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(
@@ -66,8 +72,108 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# --- FUNCIONES AUXILIARES DE IMAGEN Y SUBIDA ---
+def normalizar_url_imagen(url):
+    """Convierte enlaces de visualización de GitHub o Google Drive en enlaces directos."""
+    url = url.strip()
+    if "github.com" in url and "/blob/" in url:
+        url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+    match_drive = re.search(r"drive\.google\.com/file/d/([a-zA-Z0-9_-]+)", url)
+    if match_drive:
+        file_id = match_drive.group(1)
+        url = f"https://lh3.googleusercontent.com/d/{file_id}"
+    return url
+
+def optimizar_raster(file_bytes, filename):
+    """Redimensiona imágenes muy grandes (ej. 300ppp) a máx 1600px para carga rápida en móvil."""
+    img = Image.open(io.BytesIO(file_bytes))
+    max_dim = 1600
+    if max(img.size) > max_dim:
+        img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
+
+    out = io.BytesIO()
+    ext = filename.lower().split(".")[-1]
+    if ext == "png":
+        img.save(out, format="PNG", optimize=True)
+        return out.getvalue(), "tarjeta.png", "image/png"
+    else:
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        img.save(out, format="JPEG", quality=88, optimize=True)
+        return out.getvalue(), "tarjeta.jpg", "image/jpeg"
+
+def subir_a_catbox(file_bytes, filename, mime_type):
+    """Sube archivo (JPG, PNG o SVG) mediante multipart/form-data y devuelve URL directa."""
+    boundary = uuid.uuid4().hex
+    crlf = b"\r\n"
+    body = b"".join([
+        b"--" + boundary.encode() + crlf,
+        b'Content-Disposition: form-data; name="reqtype"' + crlf + crlf,
+        b"fileupload" + crlf,
+        b"--" + boundary.encode() + crlf,
+        f'Content-Disposition: form-data; name="fileToUpload"; filename="{filename}"'.encode() + crlf,
+        f"Content-Type: {mime_type}".encode() + crlf + crlf,
+        file_bytes + crlf,
+        b"--" + boundary.encode() + b"--" + crlf
+    ])
+    req = urllib.request.Request(
+        "https://catbox.moe/user/api.php",
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": "Mozilla/5.0"
+        }
+    )
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        res_text = resp.read().decode("utf-8").strip()
+        if res_text.startswith("http"):
+            return res_text
+    raise ValueError("No se obtuvo URL válida del servidor de alojamiento.")
+
+def subir_imagen_automatica(uploaded_file):
+    """Gestiona la optimización y subida automática de JPG, PNG o SVG."""
+    raw_bytes = uploaded_file.getvalue()
+    fname = uploaded_file.name
+    is_svg = fname.lower().endswith(".svg")
+
+    if is_svg:
+        # Si el SVG es ligero, se comprime directo en la URL sin depender de servidores externos
+        comprimido = zlib.compress(raw_bytes, level=9)
+        b64_zlib = base64.urlsafe_b64encode(comprimido).decode("ascii")
+        if len(b64_zlib) <= 1750:
+            return {"tipo": "svg_inline", "data": b64_zlib}
+        # Si es un SVG pesado, se aloja en la nube
+        url_remota = subir_a_catbox(raw_bytes, "tarjeta.svg", "image/svg+xml")
+        return {"tipo": "url", "data": url_remota}
+
+    # Para JPG / PNG: optimizar resolución y alojar
+    opt_bytes, opt_name, mime = optimizar_raster(raw_bytes, fname)
+    try:
+        b64_img = base64.b64encode(opt_bytes).decode("ascii")
+        post_data = urllib.parse.urlencode({
+            "key": "6d207e02198a847aa98d0a2a901485a5",
+            "action": "upload",
+            "source": b64_img,
+            "format": "json"
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            "https://freeimage.host/api/1/upload",
+            data=post_data,
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resultado = json.loads(resp.read().decode("utf-8"))
+            if resultado.get("status_code") == 200:
+                return {"tipo": "url", "data": resultado["image"]["url"]}
+    except Exception:
+        pass
+
+    # Respaldo automático si el primer servidor no responde
+    url_remota = subir_a_catbox(opt_bytes, opt_name, mime)
+    return {"tipo": "url", "data": url_remota}
+
 # ==============================================================================
-# MODO TARJETA DIGITAL INTERACTIVA (SE ACTIVA AL ESCANEAR EL QR INTERACTIVO)
+# VISTA 1: TARJETA DIGITAL INTERACTIVA (AL ESCANEAR QR INTERACTIVO)
 # ==============================================================================
 params = st.query_params
 if params.get("vista") == "tarjeta":
@@ -85,7 +191,11 @@ if params.get("vista") == "tarjeta":
     uri_web = t_web if t_web.startswith("http") else f"https://{t_web}"
     uri_map = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(t_dir)}"
 
-    # Generar archivo .vcf descargable desde el celular
+    btn_tel_html = f'<a class="btn-accion" href="{uri_tel}">📞 Llamar ({t_tel})</a>' if len(t_tel) > 3 else ""
+    btn_mail_html = f'<a class="btn-accion" href="{uri_mail}">✉️ Enviar Correo ({t_correo})</a>' if t_correo else ""
+    btn_web_html = f'<a class="btn-accion" href="{uri_web}" target="_blank">🌐 Visitar Sitio Web</a>' if t_web else ""
+    btn_map_html = f'<a class="btn-accion" href="{uri_map}" target="_blank">📍 Abrir Ubicación en Mapa</a>' if t_dir else ""
+
     vcf_data = (
         f"BEGIN:VCARD\n"
         f"VERSION:3.0\n"
@@ -106,10 +216,10 @@ if params.get("vista") == "tarjeta":
             <p style="margin: 0; font-weight: 600; color: #335C7A; font-size: 16px;">{t_titulo}</p>
             <p style="margin: 4px 0 18px 0; color: #555555; font-size: 14px;">{t_empresa}</p>
             <hr style="border: 0; border-top: 1px solid #D9CFC1; margin-bottom: 18px;">
-            <a class="btn-accion" href="{uri_tel}">📞 Llamar ({t_tel})</a>
-            <a class="btn-accion" href="{uri_mail}">✉️ Enviar Correo ({t_correo})</a>
-            <a class="btn-accion" href="{uri_web}" target="_blank">🌐 Visitar Sitio Web</a>
-            <a class="btn-accion" href="{uri_map}" target="_blank">📍 Abrir Ubicación en Mapa</a>
+            {btn_tel_html}
+            {btn_mail_html}
+            {btn_web_html}
+            {btn_map_html}
         </div>
     """, unsafe_allow_html=True)
 
@@ -123,6 +233,82 @@ if params.get("vista") == "tarjeta":
             mime="text/vcard",
             use_container_width=True
         )
+    st.stop()
+
+# ==============================================================================
+# VISTA 2A: VISOR DE TARJETA EN IMAGEN (JPG / PNG / SVG REMOTO)
+# ==============================================================================
+if params.get("vista") == "imagen":
+    img_url_raw = params.get("img", "")
+    img_titulo = params.get("titulo", "")
+    img_url = normalizar_url_imagen(img_url_raw)
+
+    col_i1, col_i2, col_i3 = st.columns([1, 2, 1])
+    with col_i2:
+        if img_titulo:
+            st.markdown(f"<h3 style='text-align:center; color:#003153;'>{img_titulo}</h3>", unsafe_allow_html=True)
+
+        if img_url:
+            if img_url.lower().endswith(".svg"):
+                st.markdown(
+                    f'<div style="text-align:center;"><img src="{img_url}" style="width:100%; border-radius:10px; box-shadow:0 4px 14px rgba(0,0,0,0.15);" /></div>',
+                    unsafe_allow_html=True
+                )
+            else:
+                st.image(img_url, use_container_width=True)
+
+            try:
+                req = urllib.request.Request(img_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    img_bytes = resp.read()
+                lower_u = img_url.lower()
+                if ".svg" in lower_u:
+                    ext, mime = "svg", "image/svg+xml"
+                elif ".png" in lower_u:
+                    ext, mime = "png", "image/png"
+                else:
+                    ext, mime = "jpg", "image/jpeg"
+
+                st.download_button(
+                    label="⬇️ Guardar Tarjeta en el Teléfono",
+                    data=img_bytes,
+                    file_name=f"Tarjeta_Presentacion.{ext}",
+                    mime=mime,
+                    use_container_width=True
+                )
+            except Exception:
+                st.caption("Mantén presionada la imagen para guardarla en tu teléfono.")
+        else:
+            st.warning("No se recibió ninguna dirección de imagen válida.")
+    st.stop()
+
+# ==============================================================================
+# VISTA 2B: VISOR DE TARJETA VECTORIAL SVG INCRUSTADA EN EL QR
+# ==============================================================================
+if params.get("vista") == "svg":
+    d_param = params.get("d", "")
+    img_titulo = params.get("titulo", "")
+    col_s1, col_s2, col_s3 = st.columns([1, 2, 1])
+    with col_s2:
+        if img_titulo:
+            st.markdown(f"<h3 style='text-align:center; color:#003153;'>{img_titulo}</h3>", unsafe_allow_html=True)
+        try:
+            svg_bytes = zlib.decompress(base64.urlsafe_b64decode(d_param.encode("ascii")))
+            b64_render = base64.b64encode(svg_bytes).decode("ascii")
+            st.markdown(
+                f'<div style="text-align:center;"><img src="data:image/svg+xml;base64,{b64_render}" style="width:100%; border-radius:10px; box-shadow:0 4px 14px rgba(0,0,0,0.15);" /></div>',
+                unsafe_allow_html=True
+            )
+            st.markdown("<br>", unsafe_allow_html=True)
+            st.download_button(
+                label="⬇️ Descargar Tarjeta Vectorial (.svg)",
+                data=svg_bytes,
+                file_name="Tarjeta_Presentacion.svg",
+                mime="image/svg+xml",
+                use_container_width=True
+            )
+        except Exception:
+            st.error("No se pudo decodificar el archivo SVG.")
     st.stop()
 
 # ==============================================================================
@@ -214,18 +400,15 @@ def generar_pdf_individual(png_buf, enlace_clicable=None, titulo_pie=""):
     return bytes(pdf.output())
 
 def limpiar_texto_latin1(texto):
-    """Evita errores de codificación en FPDF estándar con acentos."""
     return texto.encode("latin-1", "replace").decode("latin-1")
 
 def generar_pdf_doble_cara(png_vcard, png_interactivo, url_interactiva, nombre_completo, subtitulo, color_fondo_hex):
-    """Genera un PDF de 2 páginas (90 x 50 mm): Frente = vCard Offline | Reverso = QR Interactivo con enlaces."""
     pdf = FPDF(orientation="L", unit="mm", format=(50, 90))
     pdf.set_auto_page_break(False)
 
     r, g, b = hex_to_rgb(color_fondo_hex)
     t_r, t_g, t_b = (255, 255, 255) if (r * 0.299 + g * 0.587 + b * 0.114) < 128 else (0, 49, 83)
 
-    # --- PÁGINA 1: FRENTE (vCard Offline + Identidad) ---
     pdf.add_page()
     pdf.set_fill_color(r, g, b)
     pdf.rect(0, 0, 90, 50, style="F")
@@ -250,7 +433,6 @@ def generar_pdf_doble_cara(png_vcard, png_interactivo, url_interactiva, nombre_c
     pdf.set_xy(8, 42)
     pdf.cell(32, 4, "GUARDAR CONTACTO", align="C")
 
-    # --- PÁGINA 2: REVERSO (QR Interactivo Centrado) ---
     pdf.add_page()
     pdf.set_fill_color(r, g, b)
     pdf.rect(0, 0, 90, 50, style="F")
@@ -270,7 +452,6 @@ def generar_pdf_doble_cara(png_vcard, png_interactivo, url_interactiva, nombre_c
     return bytes(pdf.output())
 
 def generar_pdf_4qr(qrs_dict, uris_dict, color_fondo_hex):
-    """Genera un PDF tamaño tarjeta (90 x 50 mm) con los 4 QR individuales alineados."""
     pdf = FPDF(orientation="L", unit="mm", format=(50, 90))
     pdf.set_auto_page_break(False)
     pdf.add_page()
@@ -320,18 +501,24 @@ with st.sidebar:
         st.image(logo_subido, width=90, caption="Logo activo")
 
     st.markdown("---")
-    st.caption("Sugerencia láser: Usa negro (#000000) sobre blanco (#FFFFFF) y descarga el archivo SVG.")
+    st.subheader("🌐 URL Base de la App")
+    url_app_publica = st.text_input(
+        "Enlace en Streamlit Cloud:",
+        value="https://generarqr-kjz2ocyjdfvxx6eobh9y84.streamlit.app",
+        help="Se usa automáticamente para el QR Interactivo y el QR de Imagen."
+    )
 
 # --- ENCABEZADO PRINCIPAL ---
 st.title("Generador Multipropósito de Códigos QR")
-st.markdown("Crea códigos para tarjetas de presentación (vCard, Tarjeta Digital y Enlaces Directos) y etiquetas de laboratorio.")
+st.markdown("Crea códigos para tarjetas de presentación (vCard, Tarjeta Digital, Imagen y Enlaces Directos) y etiquetas de laboratorio.")
 
 # --- PESTAÑAS DE MODOS ---
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📇 1. Contacto (vCard + Digital + 4 Enlaces)",
-    "🧪 2. Reactivos / Lotes / Texto",
-    "📶 3. Acceso Wi-Fi",
-    "💬 4. WhatsApp y 📅 Evento"
+    "🖼️ 2. Tarjeta en Imagen",
+    "🧪 3. Reactivos / Lotes / Texto",
+    "📶 4. Acceso Wi-Fi",
+    "💬 5. WhatsApp y 📅 Evento"
 ])
 
 # ==============================================================================
@@ -339,12 +526,6 @@ tab1, tab2, tab3, tab4 = st.tabs([
 # ==============================================================================
 with tab1:
     st.subheader("Datos del Contacto")
-
-    url_app_publica = st.text_input(
-        "🌐 URL pública de tu aplicación en Streamlit Cloud (necesaria para el QR Único Interactivo):",
-        value="https://generador-qr.streamlit.app",
-        help="Cuando subas esta app a Streamlit Community Cloud, pega aquí su dirección web exacta."
-    )
 
     col1, col2 = st.columns(2)
     with col1:
@@ -371,7 +552,6 @@ with tab1:
     if st.button("Generar Todos los Códigos de Contacto", key="btn_contacto"):
         st.markdown("---")
 
-        # Normalizar teléfono
         tel_digits = "".join(c for c in telefono if c.isdigit())
         if len(tel_digits) == 10:
             tel_clean = f"+52{tel_digits}"
@@ -383,7 +563,6 @@ with tab1:
         uri_web = web.strip() if web.strip().startswith("http") else f"https://{web.strip()}"
         direccion_completa = f"{calle.strip()}, {ciudad.strip()}, {estado.strip()}, {cp.strip()}, México"
 
-        # 1. Cadena vCard 3.0 (Offline)
         vcard_lines = [
             "BEGIN:VCARD",
             "VERSION:3.0",
@@ -399,7 +578,6 @@ with tab1:
         ]
         vcard_str = "\n".join(vcard_lines)
 
-        # 2. URL Tarjeta Digital Interactiva (Online con botones clicables)
         base_clean = url_app_publica.strip().rstrip("/")
         query_params = urllib.parse.urlencode({
             "vista": "tarjeta",
@@ -414,12 +592,10 @@ with tab1:
         })
         url_tarjeta_interactiva = f"{base_clean}/?{query_params}"
 
-        # 3. Enlaces individuales
         uri_tel = f"tel:{tel_clean}"
         uri_email = f"mailto:{correo.strip()}?subject={urllib.parse.quote('Contacto desde tarjeta QR')}"
         uri_map = f"https://www.google.com/maps/search/?api=1&query={urllib.parse.quote(direccion_completa)}"
 
-        # --- BLOQUE A Y B EN DOS COLUMNAS: vCard vs QR INTERACTIVO ---
         col_vc, col_int = st.columns(2)
 
         with col_vc:
@@ -456,9 +632,7 @@ with tab1:
             st.markdown(f"[🔗 Probar vista de Tarjeta Digital en navegador]({url_tarjeta_interactiva})")
 
         st.markdown("---")
-
-        # --- BLOQUE C: 4 CÓDIGOS INDIVIDUALES ---
-        st.markdown("### C. Cuatro Códigos Individuales (Para envíos puntuales por correo/WhatsApp)")
+        st.markdown("### C. Cuatro Códigos Individuales")
 
         items_indiv = [
             ("tel", "📞 Llamada Directa", uri_tel, "QR_Llamada", "LLAMAR"),
@@ -487,8 +661,6 @@ with tab1:
                 st.download_button("⬇️ SVG", svg_buf, file_name=f"{fname}.svg", mime="image/svg+xml", key=f"dl_svg_{clave}")
 
         st.markdown("---")
-
-        # --- BLOQUE D: PLANTILLAS PDF LISTAS PARA IMPRIMIR (9 x 5 CM) ---
         st.markdown("### D. Plantillas PDF Listas para Imprimir (9 × 5 cm)")
         cpdf1, cpdf2 = st.columns(2)
 
@@ -520,9 +692,102 @@ with tab1:
             )
 
 # ==============================================================================
-# PESTAÑA 2: TEXTO LIBRE / REACTIVOS / LOTES
+# PESTAÑA 2: TARJETA EN IMAGEN (SUBIDA DIRECTA DE JPG, PNG O SVG)
 # ==============================================================================
 with tab2:
+    st.subheader("Generar Código QR a partir de una Tarjeta en Imagen")
+    st.markdown("Sube el archivo de tu tarjeta diseñada (**JPG, PNG o SVG**). Al escanear el QR, se mostrará tu diseño en el teléfono con opción para descargarlo.")
+
+    archivo_tarjeta = st.file_uploader(
+        "Selecciona o arrastra tu tarjeta de presentación:",
+        type=["jpg", "jpeg", "png", "svg"],
+        key="uploader_tarjeta_img"
+    )
+
+    titulo_imagen_input = st.text_input(
+        "Título opcional arriba de la tarjeta (puedes dejarlo en blanco):",
+        placeholder="Ej. Fernando López Barrera | TONAL",
+        key="titulo_tarjeta_img"
+    )
+
+    # Vista previa inmediata del archivo subido
+    if archivo_tarjeta is not None:
+        st.caption(f"Archivo cargado: **{archivo_tarjeta.name}**")
+        if archivo_tarjeta.name.lower().endswith(".svg"):
+            svg_prev_b64 = base64.b64encode(archivo_tarjeta.getvalue()).decode("ascii")
+            st.markdown(
+                f'<img src="data:image/svg+xml;base64,{svg_prev_b64}" style="max-width:360px; border-radius:8px; border:1px solid #CCC;" />',
+                unsafe_allow_html=True
+            )
+        else:
+            st.image(archivo_tarjeta, width=360)
+
+    with st.expander("Opcional: Usar un enlace externo (GitHub o Google Drive) en lugar de subir archivo"):
+        url_imagen_externa = st.text_input(
+            "Enlace web de la imagen:",
+            placeholder="https://...",
+            key="url_ext_img"
+        )
+
+    if st.button("Generar QR de la Tarjeta", key="btn_imagen"):
+        base_clean = url_app_publica.strip().rstrip("/")
+        url_visor_final = None
+
+        if archivo_tarjeta is not None:
+            with st.spinner("Preparando tarjeta y generando código QR..."):
+                try:
+                    res = subir_imagen_automatica(archivo_tarjeta)
+                    if res["tipo"] == "svg_inline":
+                        q_params = urllib.parse.urlencode({
+                            "vista": "svg",
+                            "d": res["data"],
+                            "titulo": titulo_imagen_input.strip()
+                        })
+                    else:
+                        q_params = urllib.parse.urlencode({
+                            "vista": "imagen",
+                            "img": res["data"],
+                            "titulo": titulo_imagen_input.strip()
+                        })
+                    url_visor_final = f"{base_clean}/?{q_params}"
+                except Exception as e:
+                    st.error(f"No se pudo procesar la imagen automáticamente: {e}")
+
+        elif url_imagen_externa.strip():
+            url_img_limpia = normalizar_url_imagen(url_imagen_externa)
+            q_params = urllib.parse.urlencode({
+                "vista": "imagen",
+                "img": url_img_limpia,
+                "titulo": titulo_imagen_input.strip()
+            })
+            url_visor_final = f"{base_clean}/?{q_params}"
+        else:
+            st.warning("Sube primero una imagen (JPG, PNG o SVG) para generar el código QR.")
+
+        if url_visor_final:
+            png_img_qr, _ = generar_qr_png(url_visor_final, color_frente, color_fondo, logo_subido, estilo_redondo)
+            svg_img_qr = generar_qr_svg(url_visor_final)
+            pdf_img_qr = generar_pdf_individual(png_img_qr, enlace_clicable=url_visor_final, titulo_pie="VER TARJETA")
+
+            st.markdown("---")
+            ci1, ci2 = st.columns([1, 2])
+            with ci1:
+                st.image(png_img_qr, width=220)
+            with ci2:
+                st.success("¡Código QR listo! Al escanearlo mostrará tu tarjeta y permitirá guardarla en el teléfono.")
+                st.markdown(f"[🔗 Probar cómo se verá en el teléfono]({url_visor_final})")
+                bi1, bi2, bi3 = st.columns(3)
+                with bi1:
+                    st.download_button("⬇️ PNG (300ppp)", png_img_qr, file_name="QR_Tarjeta_Imagen.png", mime="image/png", key="img_png")
+                with bi2:
+                    st.download_button("⬇️ PDF Clicable", pdf_img_qr, file_name="QR_Tarjeta_Imagen.pdf", mime="application/pdf", key="img_pdf")
+                with bi3:
+                    st.download_button("⬇️ SVG Láser", svg_img_qr, file_name="QR_Tarjeta_Imagen.svg", mime="image/svg+xml", key="img_svg")
+
+# ==============================================================================
+# PESTAÑA 3: TEXTO LIBRE / REACTIVOS / LOTES
+# ==============================================================================
+with tab3:
     st.subheader("Etiquetado de Laboratorio, Reactivos o Información General")
     modo_lab = st.radio("Formato de entrada:", ["Plantilla rápida de Reactivo / Muestra", "Texto libre personalizado"], horizontal=True)
 
@@ -533,8 +798,8 @@ with tab2:
             concentracion = st.text_input("Concentración / Especificación", placeholder="Ej. pH 7.4 | Lote #2026-11")
             almacenamiento = st.text_input("Condiciones de almacenamiento", placeholder="Ej. 4 °C - Proteger de la luz")
         with cl2:
-            fecha_prep = st.text_input("Fecha de preparación / ingreso", placeholder="Ej. 18/Nov/2026")
-            fecha_cad = st.text_input("Caducidad / Revisión", placeholder="Ej. 18/Dic/2026")
+            fecha_prep = st.text_input("Fecha de preparación / ingreso", placeholder="Ej. 23/Nov/2026")
+            fecha_cad = st.text_input("Caducidad / Revisión", placeholder="Ej. 23/Dic/2026")
             responsable = st.text_input("Responsable / Notas", value="Lab. Investigación - F. López")
 
         texto_codificar = (
@@ -569,9 +834,9 @@ with tab2:
             st.warning("Ingresa algún texto antes de generar el código.")
 
 # ==============================================================================
-# PESTAÑA 3: ACCESO WI-FI
+# PESTAÑA 4: ACCESO WI-FI
 # ==============================================================================
-with tab3:
+with tab4:
     st.subheader("Conexión Automática a Red Wi-Fi")
     cw1, cw2, cw3 = st.columns(3)
     with cw1:
@@ -594,9 +859,9 @@ with tab3:
             st.download_button("⬇️ Descargar SVG", svg_wifi, file_name=f"QR_WiFi_{ssid}.svg", mime="image/svg+xml")
 
 # ==============================================================================
-# PESTAÑA 4: WHATSAPP Y EVENTO DE CALENDARIO
+# PESTAÑA 5: WHATSAPP Y EVENTO DE CALENDARIO
 # ==============================================================================
-with tab4:
+with tab5:
     col_wa, col_cal = st.columns(2)
 
     with col_wa:
